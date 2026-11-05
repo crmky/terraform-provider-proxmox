@@ -4022,3 +4022,449 @@ func TestAccResourceContainerDestroyPurgesHAResource(t *testing.T) {
 		},
 	})
 }
+func TestAccResourceContainerLXC(t *testing.T) {
+	te := InitEnvironment(t)
+	imageFileName := fmt.Sprintf("%d-alpine-3.22-default_20250617_amd64.tar.xz", time.Now().UnixMicro())
+	testAccDownloadContainerTemplate(t, te, imageFileName)
+
+	accTestContainerID := 100000 + rand.Intn(99999)
+
+	te.AddTemplateVars(map[string]interface{}{
+		"ImageFileName":   imageFileName,
+		"TestContainerID": accTestContainerID,
+		"TimeoutDelete":   300,
+	})
+
+	var rebootCheckStart time.Time
+
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: te.AccProviders,
+		Steps: []resource.TestStep{
+			{
+				// Step 1: Create container with low-level lxc entries.
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					started = false
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					lxc {
+						key   = "cgroup.relative"
+						value = "1"
+					}
+					lxc {
+						key   = "log.level"
+						value = "0"
+					}
+					initialization {
+						hostname = "test-lxc"
+						ip_config {
+							ipv4 {
+								address = "dhcp"
+							}
+						}
+					}
+					network_interface {
+						name = "vmbr0"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}`, WithRootPassword()),
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes(accTestContainerName, map[string]string{
+						"lxc.#":       "2",
+						"lxc.0.key":   "cgroup.relative",
+						"lxc.0.value": "1",
+						"lxc.1.key":   "log.level",
+						"lxc.1.value": "0",
+					}),
+					func(*terraform.State) error {
+						ct := te.NodeClient().Container(accTestContainerID)
+
+						ctInfo, err := ct.GetContainer(t.Context())
+						require.NoError(te.t, err, "failed to get container")
+
+						require.Len(te.t, ctInfo.LXCConfig.Raw, 2, "Raw should preserve all LXC entries")
+						require.Equal(te.t, "lxc.cgroup.relative", ctInfo.LXCConfig.Raw[0][0])
+						require.Equal(te.t, "1", ctInfo.LXCConfig.Raw[0][1])
+						require.Equal(te.t, "lxc.log.level", ctInfo.LXCConfig.Raw[1][0])
+						require.Equal(te.t, "0", ctInfo.LXCConfig.Raw[1][1])
+
+						return nil
+					},
+				),
+			},
+			{
+				// Step 2: Update lxc entries.
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					started = false
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					lxc {
+						key   = "cgroup.relative"
+						value = "0"
+					}
+					initialization {
+						hostname = "test-lxc"
+						ip_config {
+							ipv4 {
+								address = "dhcp"
+							}
+						}
+					}
+					network_interface {
+						name = "vmbr0"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}`, WithRootPassword()),
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes(accTestContainerName, map[string]string{
+						"lxc.#":       "1",
+						"lxc.0.key":   "cgroup.relative",
+						"lxc.0.value": "0",
+					}),
+				),
+			},
+			{
+				// Step 3: Remove all lxc entries.
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					started = false
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					initialization {
+						hostname = "test-lxc"
+						ip_config {
+							ipv4 {
+								address = "dhcp"
+							}
+						}
+					}
+					network_interface {
+						name = "vmbr0"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}`, WithRootPassword()),
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes(accTestContainerName, map[string]string{
+						"lxc.#": "0",
+					}),
+					func(*terraform.State) error {
+						ct := te.NodeClient().Container(accTestContainerID)
+
+						ctInfo, err := ct.GetContainer(t.Context())
+						require.NoError(te.t, err, "failed to get container")
+
+						for _, pair := range ctInfo.LXCConfig.Raw {
+							require.NotEqual(te.t, "lxc.cgroup.relative", pair[0])
+							require.NotEqual(te.t, "lxc.log.level", pair[0])
+						}
+
+						return nil
+					},
+				),
+			},
+			{
+				// Step 4: Start the container and combine idmap + lxc blocks (shared SSH writer).
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					started = true
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					idmap {
+						type         = "uid"
+						container_id = 0
+						host_id      = 100000
+						size         = 65536
+					}
+					idmap {
+						type         = "gid"
+						container_id = 0
+						host_id      = 100000
+						size         = 65536
+					}
+					lxc {
+						key   = "log.level"
+						value = "1"
+					}
+					lxc {
+						key   = "environment"
+						value = "FOO=bar"
+					}
+					initialization {
+						hostname = "test-lxc"
+						ip_config {
+							ipv4 {
+								address = "dhcp"
+							}
+						}
+					}
+					network_interface {
+						name = "vmbr0"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}`, WithRootPassword()),
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes(accTestContainerName, map[string]string{
+						"idmap.#":     "2",
+						"lxc.#":       "2",
+						"lxc.0.key":   "log.level",
+						"lxc.0.value": "1",
+						"lxc.1.key":   "environment",
+						"lxc.1.value": "FOO=bar",
+					}),
+					func(*terraform.State) error {
+						ct := te.NodeClient().Container(accTestContainerID)
+
+						ctInfo, err := ct.GetContainer(t.Context())
+						require.NoError(te.t, err, "failed to get container")
+
+						require.Len(te.t, ctInfo.LXCConfig.IDMaps, 2)
+						require.Len(te.t, ctInfo.LXCConfig.Raw, 4, "Raw should contain idmap and lxc entries")
+
+						raw := map[string]string{}
+						for _, pair := range ctInfo.LXCConfig.Raw {
+							raw[pair[0]] = pair[1]
+						}
+						require.Equal(te.t, "1", raw["lxc.log.level"])
+						require.Equal(te.t, "FOO=bar", raw["lxc.environment"])
+
+						status, err := ct.GetContainerStatus(t.Context())
+						require.NoError(te.t, err, "failed to get container status")
+						require.Equal(te.t, "running", status.Status)
+
+						return nil
+					},
+				),
+			},
+			{
+				// Step 5: Change an lxc value on the running container — requires a reboot.
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					started = true
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					idmap {
+						type         = "uid"
+						container_id = 0
+						host_id      = 100000
+						size         = 65536
+					}
+					idmap {
+						type         = "gid"
+						container_id = 0
+						host_id      = 100000
+						size         = 65536
+					}
+					lxc {
+						key   = "log.level"
+						value = "1"
+					}
+					lxc {
+						key   = "environment"
+						value = "FOO=baz"
+					}
+					initialization {
+						hostname = "test-lxc"
+						ip_config {
+							ipv4 {
+								address = "dhcp"
+							}
+						}
+					}
+					network_interface {
+						name = "vmbr0"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}`, WithRootPassword()),
+				PreConfig: func() {
+					rebootCheckStart = time.Now()
+				},
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes(accTestContainerName, map[string]string{
+						"lxc.1.value": "FOO=baz",
+					}),
+					func(*terraform.State) error {
+						ct := te.NodeClient().Container(accTestContainerID)
+
+						// An uptime lower than the time elapsed since PreConfig proves the
+						// container was rebooted to apply the lxc change.
+						status, err := ct.GetContainerStatus(t.Context())
+						require.NoError(te.t, err, "failed to get container status")
+						require.Equal(te.t, "running", status.Status)
+						require.NotNil(te.t, status.Uptime)
+						require.Less(te.t, *status.Uptime, int(time.Since(rebootCheckStart).Seconds()),
+							"container should have rebooted to apply the lxc change")
+
+						return nil
+					},
+				),
+			},
+			{
+				ResourceName:      accTestContainerName,
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateId:     fmt.Sprintf("%s/%d", te.NodeName, accTestContainerID),
+				// Timeouts are provider-local and template_file_id is preserved from config only;
+				// neither is returned by the API on import.
+				ImportStateVerifyIgnore: []string{
+					"timeout_create",
+					"timeout_clone",
+					"timeout_update",
+					"timeout_delete",
+					"timeout_start",
+					"operating_system.0.template_file_id",
+				},
+			},
+		},
+	})
+}
+
+// TestAccResourceContainerCloneLXC verifies that low-level lxc entries inherited from a
+// cloned template container survive the SSH rewrite triggered by the clone's own idmap
+// block: undeclared lines are merged back into the rewritten config, and the Read
+// clone-guard keeps the inherited lines out of the clone's state (no perpetual diff).
+func TestAccResourceContainerCloneLXC(t *testing.T) {
+	te := InitEnvironment(t)
+	imageFileName := fmt.Sprintf("%d-alpine-3.22-default_20250617_amd64.tar.xz", time.Now().UnixMicro())
+	testAccDownloadContainerTemplate(t, te, imageFileName)
+
+	accTestContainerID := 100000 + rand.Intn(99999)
+	accTestContainerIDClone := 100000 + rand.Intn(99999)
+
+	te.AddTemplateVars(map[string]interface{}{
+		"ImageFileName":        imageFileName,
+		"TestContainerID":      accTestContainerID,
+		"TestContainerIDClone": accTestContainerIDClone,
+		"TimeoutDelete":        300,
+	})
+
+	resource.ParallelTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: te.AccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: te.RenderConfig(`
+				resource "proxmox_virtual_environment_container" "test_container" {
+					node_name = "{{.NodeName}}"
+					vm_id     = {{.TestContainerID}}
+					timeout_delete = {{ .TimeoutDelete }}
+					template  = true
+					unprivileged = true
+					disk {
+						datastore_id = "local-lvm"
+						size         = 4
+					}
+					lxc {
+						key   = "log.level"
+						value = "1"
+					}
+					lxc {
+						key   = "environment"
+						value = "FOO=bar"
+					}
+					initialization {
+						hostname = "test-lxc-clone-src"
+					}
+					operating_system {
+						template_file_id = "local:vztmpl/{{.ImageFileName}}"
+						type             = "alpine"
+					}
+				}
+				resource "proxmox_virtual_environment_container" "test_container_clone" {
+					depends_on = [proxmox_virtual_environment_container.test_container]
+					node_name  = "{{.NodeName}}"
+					vm_id      = {{.TestContainerIDClone}}
+					timeout_delete = {{ .TimeoutDelete }}
+					unprivileged = true
+					// Kept stopped: a uid-only idmap (no gid mapping) on an
+					// unprivileged container cannot start. First-boot idmap
+					// behavior is covered by the dedicated IDMap first-boot tests.
+					started = false
+					clone {
+						vm_id = proxmox_virtual_environment_container.test_container.id
+					}
+					idmap {
+						type         = "uid"
+						container_id = 0
+						host_id      = 100000
+						size         = 65536
+					}
+					initialization {
+						hostname = "test-lxc-clone"
+					}
+				}`, WithRootPassword()),
+				Check: resource.ComposeTestCheckFunc(
+					ResourceAttributes("proxmox_virtual_environment_container.test_container_clone", map[string]string{
+						"idmap.#": "1",
+						// The clone-guard keeps inherited lxc lines out of the state.
+						"lxc.#": "0",
+					}),
+					func(*terraform.State) error {
+						ct := te.NodeClient().Container(accTestContainerIDClone)
+
+						ctInfo, err := ct.GetContainer(t.Context())
+						require.NoError(te.t, err, "failed to get clone container")
+
+						raw := map[string]string{}
+						for _, pair := range ctInfo.LXCConfig.Raw {
+							raw[pair[0]] = pair[1]
+						}
+
+						// Inherited from the template and preserved by the writer.
+						require.Equal(te.t, "1", raw["lxc.log.level"])
+						require.Equal(te.t, "FOO=bar", raw["lxc.environment"])
+						// Written from the clone's declared idmap block.
+						require.Equal(te.t, "u 0 100000 65536", raw["lxc.idmap"])
+
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+

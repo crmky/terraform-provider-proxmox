@@ -282,6 +282,20 @@ type ListResponseData struct {
 	VMID     int               `json:"vmid,omitempty"`
 }
 
+// ListSnapshotsResponseBody contains the body from a container snapshot list response.
+type ListSnapshotsResponseBody struct {
+	Data []*ListSnapshotsResponseData `json:"data,omitempty"`
+}
+
+// ListSnapshotsResponseData contains the data from a container snapshot list response.
+type ListSnapshotsResponseData struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
+	Parent      *string `json:"parent,omitempty"`
+	SnapTime    *int64  `json:"snaptime,omitempty"`
+	Digest      *string `json:"digest,omitempty"`
+}
+
 // MigrateRequestBody contains the body for a container migration request.
 // LXC has no live migration: a running container is migrated by shutting it down, moving it, and
 // starting it again, which PVE performs server-side when restart is set.

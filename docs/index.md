@@ -311,7 +311,7 @@ SSH connection is **only** required for these specific operations:
 | Upload snippets                     | `proxmox_virtual_environment_file`      | Proxmox API doesn't support snippet uploads     |
 | Upload certain file types           | `proxmox_virtual_environment_file`      | Some content types require direct node access   |
 | Import disks via `source_file.path` | `proxmox_virtual_environment_vm`        | Local file transfer to node                     |
-| Configure `idmap` entries           | `proxmox_virtual_environment_container` | Proxmox API doesn't support `lxc[n]` parameters |
+| Configure `idmap` and `lxc` entries | `proxmox_virtual_environment_container` | Proxmox API doesn't support `lxc[n]` parameters |
 
 **SSH is NOT required for:**
 
@@ -468,12 +468,16 @@ In the example below, we create a user `terraform` and assign the `sudo` privile
 
     This rule allows plain permission bits only. `sudo` refuses modes with the setuid, setgid or sticky bit, such as `4755`.
 
-  - **LXC `idmap`** on `proxmox_virtual_environment_container` — the provider edits the container configuration file via SSH:
+  - **LXC `idmap` and `lxc`** on `proxmox_virtual_environment_container` — the provider edits the container configuration file via SSH:
 
     ```text
     terraform ALL=(root) NOPASSWD: /usr/bin/sed ^-i /\^lxc\\\.idmap:/d /etc/pve/lxc/[0-9]+\.conf$
+    terraform ALL=(root) NOPASSWD: /usr/bin/sed ^-i 1,/\^\\\[/\{/\^lxc\\\./d;\} /etc/pve/lxc/[0-9]+\.conf$
+    terraform ALL=(root) NOPASSWD: /usr/bin/sed ^-i 1,/\^\\\[/ s\|.*\| /etc/pve/lxc/[0-9]+\.conf$
     terraform ALL=(root) NOPASSWD: /usr/bin/tee ^-a /etc/pve/lxc/[0-9]+\.conf$
     ```
+
+    The second and third rules cover the `lxc` block: scoped deletion of `lxc.*` lines in the main section, and insertion before the first snapshot section. The `.*` in the third rule is required because the inserted lines carry user-provided values; the provider escapes shell and sed metacharacters in those values, but the rule itself cannot distinguish a hand-crafted `sed` script with the same prefix, so only use it when the Terraform configuration and state are trusted.
 
   !> **Security Warning:** Do not use shell-style wildcards (`*`) in these rules, even after a strict filename pattern. sudoers matches all arguments as a single string, and `*` matches spaces, `/` and `../`. A rule such as `/usr/bin/tee /var/lib/vz/snippets/[a-zA-Z0-9_]*` therefore also allows writing to other paths (`/var/lib/vz/snippets/ab/../../../../etc/sudoers.d/malicious`, or a second file argument), and `/usr/bin/sed -i * …` allows running arbitrary commands through `sed`. Both lead to full privilege escalation. If you configured these rules from an earlier version of this guide, replace them with the ones above.
 

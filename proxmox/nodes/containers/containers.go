@@ -196,6 +196,22 @@ func (c *Client) ListContainers(ctx context.Context) ([]*ListResponseData, error
 	return resBody.Data, nil
 }
 
+// ListSnapshots retrieves a list of container snapshots.
+func (c *Client) ListSnapshots(ctx context.Context) ([]*ListSnapshotsResponseData, error) {
+	resBody := &ListSnapshotsResponseBody{}
+
+	err := c.DoRequest(ctx, http.MethodGet, c.ExpandPath("snapshot"), nil, resBody)
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving container snapshots: %w", err)
+	}
+
+	if resBody.Data == nil {
+		return nil, api.ErrNoDataObjectInResponse
+	}
+
+	return resBody.Data, nil
+}
+
 // WaitForContainerNetworkInterfaces waits for a container to publish its network interfaces.
 func (c *Client) WaitForContainerNetworkInterfaces(
 	ctx context.Context,

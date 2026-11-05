@@ -7,6 +7,7 @@
 package resource
 
 import (
+	"encoding/base64"
 	"regexp"
 	"testing"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/containers"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/types"
 	"github.com/bpg/terraform-provider-proxmox/proxmoxtf/test"
 )
@@ -471,4 +473,312 @@ func TestHARestoreState(t *testing.T) {
 			assert.Equal(t, tt.want, haRestoreState(tt.original, tt.startedChanged, tt.started))
 		})
 	}
+}
+func TestContainerValidateLXCKey(t *testing.T) {
+	t.Parallel()
+
+	validCases := []string{
+		"cgroup2.devices.allow",
+		"mount.entry",
+		"hook.pre-start",
+		"environment",
+		"cap.drop",
+		"seccomp.profile",
+	}
+
+	for _, key := range validCases {
+		warnings, errs := containerValidateLXCKey(key, "")
+		assert.Empty(t, warnings)
+		assert.Empty(t, errs, "expected %q to be valid", key)
+	}
+
+	invalidCases := []struct {
+		key     string
+		message string
+	}{
+		{"", "empty key"},
+		{"idmap", "reserved key"},
+		{"Cgroup2.Devices.Allow", "uppercase in key"},
+		{"cgroup2 devices", "space in key"},
+		{"cgroup2:devices", "colon in key"},
+		{"cgroup2=devices", "equals sign in key"},
+		{"cgroup2\ndevices", "newline in key"},
+		{"lxc.cgroup2.devices.allow", "lxc prefix"},
+	}
+
+	for _, tc := range invalidCases {
+		warnings, errs := containerValidateLXCKey(tc.key, "")
+		assert.Empty(t, warnings)
+		assert.NotEmpty(t, errs, "expected %q (%s) to be invalid", tc.key, tc.message)
+	}
+}
+
+func TestContainerValidateLXCValue(t *testing.T) {
+	t.Parallel()
+
+	validCases := []string{
+		"c 10:200 rwm",
+		"/dev/dri dev/dri none bind,optional,create=dir",
+		"",
+		"NVIDIA_VISIBLE_DEVICES=all",
+	}
+
+	for _, val := range validCases {
+		warnings, errs := containerValidateLXCValue(val, "")
+		assert.Empty(t, warnings)
+		assert.Empty(t, errs, "expected %q to be valid", val)
+	}
+
+	invalidCases := []string{
+		"line1\nline2",
+		"line1\rline2",
+		"line1\r\nline2",
+	}
+
+	for _, val := range invalidCases {
+		warnings, errs := containerValidateLXCValue(val, "")
+		assert.Empty(t, warnings)
+		assert.NotEmpty(t, errs, "expected %q to be invalid", val)
+	}
+}
+
+func TestContainerLXCConfigLines(t *testing.T) {
+	t.Parallel()
+
+	idmaps := []containers.CustomIDMapEntry{
+		{Type: "uid", ContainerID: 0, HostID: 100000, Size: 65536},
+		{Type: "gid", ContainerID: 0, HostID: 100000, Size: 65536},
+	}
+
+	configs := []containerLXCConfigEntry{
+		{Key: "cgroup2.devices.allow", Value: "c 10:200 rwm"},
+		{Key: "cap.drop", Value: ""},
+		{Key: "mount.entry", Value: "/src /dst none bind 0 0"},
+	}
+
+	lines := containerLXCConfigLines(idmaps, configs)
+
+	expected := []string{
+		"lxc.idmap: u 0 100000 65536",
+		"lxc.idmap: g 0 100000 65536",
+		"lxc.cgroup2.devices.allow: c 10:200 rwm",
+		"lxc.cap.drop: ",
+		"lxc.mount.entry: /src /dst none bind 0 0",
+	}
+
+	assert.Equal(t, expected, lines)
+}
+
+func TestContainerGetLXCConfigs(t *testing.T) {
+	t.Parallel()
+
+	input := []any{
+		map[string]any{
+			mkLXCKey:   "cgroup2.devices.allow",
+			mkLXCValue: "c 10:200 rwm",
+		},
+		map[string]any{
+			mkLXCKey:   "cap.drop",
+			mkLXCValue: "",
+		},
+	}
+
+	configs := containerGetLXCConfigs(input)
+
+	expected := []containerLXCConfigEntry{
+		{Key: "cgroup2.devices.allow", Value: "c 10:200 rwm"},
+		{Key: "cap.drop", Value: ""},
+	}
+
+	assert.Equal(t, expected, configs)
+}
+
+func TestContainerSedEscapeReplacement(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"ampersand", `a & b`, `a \& b`},
+		{"backslash", `C:\path\to`, `C:\\path\\to`},
+		{"pipe", `a|b`, `a\|b`},
+		{"all combined", `a\b & c|d`, `a\\b \& c\|d`},
+		{"single quote untouched", `it's`, `it's`},
+		{"plain", `c 10:200 rwm`, `c 10:200 rwm`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, containerSedEscapeReplacement(tt.input))
+		})
+	}
+}
+
+func TestContainerShellQuote(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"plain", `abc`, `'abc'`},
+		{"single quote", `it's`, `'it'\''s'`},
+		{"double quotes untouched", `say "hi"`, `'say "hi"'`},
+		{"empty", ``, `''`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, containerShellQuote(tt.input))
+		})
+	}
+}
+
+func TestContainerMergedLXCLines(t *testing.T) {
+	t.Parallel()
+
+	idmaps := []containers.CustomIDMapEntry{
+		{Type: "uid", ContainerID: 0, HostID: 100000, Size: 65536},
+	}
+
+	t.Run("clone with inherited lines and empty old state preserves inherited lines", func(t *testing.T) {
+		t.Parallel()
+
+		raw := [][2]string{
+			{"lxc.idmap", "u 0 100000 65536"},
+			{"lxc.cgroup2.devices.allow", "c 195:* rwm"},
+			{"lxc.mount.entry", "/dev/dri dev/dri none bind,optional,create=dir"},
+		}
+		newConfigs := []containerLXCConfigEntry{
+			{Key: "environment", Value: "NVIDIA_VISIBLE_DEVICES=all"},
+		}
+
+		lines := containerMergedLXCLines(raw, idmaps, nil, newConfigs)
+
+		expected := []string{
+			"lxc.idmap: u 0 100000 65536",
+			"lxc.cgroup2.devices.allow: c 195:* rwm",
+			"lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir",
+			"lxc.environment: NVIDIA_VISIBLE_DEVICES=all",
+		}
+		assert.Equal(t, expected, lines)
+	})
+
+	t.Run("removed declaration drops the line", func(t *testing.T) {
+		t.Parallel()
+
+		raw := [][2]string{
+			{"lxc.cgroup2.devices.allow", "c 10:200 rwm"},
+			{"lxc.mount.entry", "/src /dst none bind 0 0"},
+		}
+		oldConfigs := []containerLXCConfigEntry{
+			{Key: "cgroup2.devices.allow", Value: "c 10:200 rwm"},
+			{Key: "mount.entry", Value: "/src /dst none bind 0 0"},
+		}
+		newConfigs := []containerLXCConfigEntry{
+			{Key: "cgroup2.devices.allow", Value: "c 10:200 rwm"},
+		}
+
+		lines := containerMergedLXCLines(raw, nil, oldConfigs, newConfigs)
+
+		expected := []string{
+			"lxc.cgroup2.devices.allow: c 10:200 rwm",
+		}
+		assert.Equal(t, expected, lines)
+	})
+
+	t.Run("declared key overrides inherited line with the same key", func(t *testing.T) {
+		t.Parallel()
+
+		raw := [][2]string{
+			{"lxc.mount.entry", "/old /old none bind 0 0"},
+		}
+		newConfigs := []containerLXCConfigEntry{
+			{Key: "mount.entry", Value: "/new /new none bind 0 0"},
+		}
+
+		lines := containerMergedLXCLines(raw, nil, nil, newConfigs)
+
+		expected := []string{
+			"lxc.mount.entry: /new /new none bind 0 0",
+		}
+		assert.Equal(t, expected, lines)
+	})
+
+	t.Run("lxc.idmap raw lines are always skipped and order is preserved", func(t *testing.T) {
+		t.Parallel()
+
+		raw := [][2]string{
+			{"lxc.idmap", "u 0 100000 65536"},
+			{"lxc.seccomp.profile", "/usr/share/lxc/config/common.conf"},
+			{"lxc.idmap", "g 0 100000 65536"},
+			{"lxc.cap.drop", ""},
+			{"lxc.environment", "FOO=bar"},
+		}
+
+		lines := containerMergedLXCLines(raw, nil, nil, nil)
+
+		expected := []string{
+			"lxc.seccomp.profile: /usr/share/lxc/config/common.conf",
+			"lxc.cap.drop: ",
+			"lxc.environment: FOO=bar",
+		}
+		assert.Equal(t, expected, lines)
+	})
+}
+
+func TestContainerLXCDeleteCommand(t *testing.T) {
+	t.Parallel()
+
+	cmd := containerLXCDeleteCommand("/etc/pve/lxc/100.conf")
+	assert.Equal(t, `try_sudo sed -i '1,/^\[/{/^lxc\./d;}' /etc/pve/lxc/100.conf`, cmd)
+}
+
+func TestContainerLXCInsertCommand(t *testing.T) {
+	t.Parallel()
+
+	lines := []string{
+		"lxc.idmap: u 0 100000 65536",
+		"lxc.mount.entry: /new /new none bind 0 0",
+	}
+
+	t.Run("no snapshots appends via base64 and tee", func(t *testing.T) {
+		t.Parallel()
+
+		cmd := containerLXCInsertCommand("/etc/pve/lxc/100.conf", lines, false)
+
+		content := base64.StdEncoding.EncodeToString(
+			[]byte("lxc.idmap: u 0 100000 65536\nlxc.mount.entry: /new /new none bind 0 0"))
+		expected := `printf '%s' "` + content + `" | base64 -d | try_sudo tee -a /etc/pve/lxc/100.conf > /dev/null`
+		assert.Equal(t, expected, cmd)
+	})
+
+	t.Run("snapshots insert before first section header via sed", func(t *testing.T) {
+		t.Parallel()
+
+		cmd := containerLXCInsertCommand("/etc/pve/lxc/100.conf", lines, true)
+
+		expected := `try_sudo sed -i '1,/^\[/ s|^\[|lxc.idmap: u 0 100000 65536\nlxc.mount.entry: /new /new none bind 0 0\n\n[|' /etc/pve/lxc/100.conf`
+		assert.Equal(t, expected, cmd)
+	})
+
+	t.Run("snapshots escape sed replacement metacharacters and shell quotes", func(t *testing.T) {
+		t.Parallel()
+
+		tricky := []string{
+			`lxc.mount.entry: /a&b /c|d none bind 0 0`,
+			`lxc.environment: QUOTED='value' PATH=C:\bin`,
+		}
+
+		cmd := containerLXCInsertCommand("/etc/pve/lxc/100.conf", tricky, true)
+
+		expected := `try_sudo sed -i '1,/^\[/ s|^\[|lxc.mount.entry: /a\&b /c\|d none bind 0 0\n` +
+			`lxc.environment: QUOTED='\''value'\'' PATH=C:\\bin\n\n[|' /etc/pve/lxc/100.conf`
+		assert.Equal(t, expected, cmd)
+	})
 }

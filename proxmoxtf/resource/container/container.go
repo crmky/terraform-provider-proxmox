@@ -8,6 +8,7 @@ package resource
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"regexp"
@@ -189,6 +190,9 @@ const (
 	mkIDMapContainerID                  = "container_id"
 	mkIDMapHostID                       = "host_id"
 	mkIDMapSize                         = "size"
+	mkLXC                               = "lxc"
+	mkLXCKey                            = "key"
+	mkLXCValue                          = "value"
 	mkNetworkInterface                  = "network_interface"
 	mkNetworkInterfaceBridge            = "bridge"
 	mkNetworkInterfaceEnabled           = "enabled"
@@ -877,6 +881,28 @@ func Container() *schema.Resource {
 							Description:      "Number of IDs to map",
 							Required:         true,
 							ValidateDiagFunc: validation.ToDiagFunc(validation.IntAtLeast(1)),
+						},
+					},
+				},
+			},
+			mkLXC: {
+				Type:        schema.TypeList,
+				Description: "Additional low-level LXC configuration options",
+				Optional:    true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						mkLXCKey: {
+							Type:             schema.TypeString,
+							Description:      "The LXC option name, without the 'lxc.' prefix",
+							Required:         true,
+							ValidateDiagFunc: validation.ToDiagFunc(containerValidateLXCKey),
+						},
+						mkLXCValue: {
+							Type:             schema.TypeString,
+							Description:      "The LXC option value",
+							Optional:         true,
+							Default:          "",
+							ValidateDiagFunc: validation.ToDiagFunc(containerValidateLXCValue),
 						},
 					},
 				},
@@ -1758,10 +1784,12 @@ func containerCreateClone(ctx context.Context, d *schema.ResourceData, m any) di
 		return diag.FromErr(err)
 	}
 
-	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// Apply idmap and low-level lxc configuration via SSH (the API does not support lxc[n] parameters).
 	// This must happen after the lock is released to avoid PVE overwriting the config file.
-	if len(idmaps) > 0 {
-		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+	lxcConfigs := containerGetLXCConfigs(d.Get(mkLXC).([]any))
+
+	if len(containerLXCConfigLines(idmaps, lxcConfigs)) > 0 {
+		if err := containerSetLXCConfigs(ctx, client, nodeName, vmID, idmaps, nil, lxcConfigs); err != nil {
 			return diag.FromErr(err)
 		}
 	}
@@ -2317,10 +2345,12 @@ func containerCreateCustom(ctx context.Context, d *schema.ResourceData, m any) d
 		return diag.FromErr(err)
 	}
 
-	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// Apply idmap and low-level lxc configuration via SSH (the API does not support lxc[n] parameters).
 	// This must happen after the lock is released to avoid PVE overwriting the config file.
-	if len(idmaps) > 0 {
-		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+	lxcConfigs := containerGetLXCConfigs(d.Get(mkLXC).([]any))
+
+	if len(containerLXCConfigLines(idmaps, lxcConfigs)) > 0 {
+		if err := containerSetLXCConfigs(ctx, client, nodeName, vmID, idmaps, nil, lxcConfigs); err != nil {
 			return diag.FromErr(err)
 		}
 	}
@@ -2640,40 +2670,249 @@ func containerGetIDMaps(list []any) []containers.CustomIDMapEntry {
 	return idmaps
 }
 
-func containerSetIDMaps(
+// regexLXCKey matches the allowed charset for low-level lxc config keys. It also
+// closes off newline injection into the container config file via key names.
+var regexLXCKey = regexp.MustCompile(`^[a-z0-9._-]+$`)
+
+func containerValidateLXCKey(v any, _ string) ([]string, []error) {
+	var warnings []string
+	var errs []error
+
+	key, ok := v.(string)
+	if !ok {
+		errs = append(errs, fmt.Errorf("expected string, got %T", v))
+		return warnings, errs
+	}
+
+	if strings.TrimSpace(key) == "" {
+		errs = append(errs, fmt.Errorf("lxc key must not be empty"))
+	}
+
+	if key == "idmap" {
+		errs = append(errs, fmt.Errorf("use the idmap block instead of lxc key %q", key))
+	}
+
+	if strings.HasPrefix(key, "lxc.") {
+		errs = append(errs, fmt.Errorf("lxc key must not include the 'lxc.' prefix: %q", key))
+	}
+
+	if !regexLXCKey.MatchString(key) {
+		errs = append(errs, fmt.Errorf("lxc key must only contain lowercase letters, digits, dots, underscores and hyphens: %q", key))
+	}
+
+	return warnings, errs
+}
+
+func containerValidateLXCValue(v any, _ string) ([]string, []error) {
+	var warnings []string
+	var errs []error
+
+	val, ok := v.(string)
+	if !ok {
+		errs = append(errs, fmt.Errorf("expected string, got %T", v))
+		return warnings, errs
+	}
+
+	if strings.ContainsAny(val, "\r\n") {
+		errs = append(errs, fmt.Errorf("lxc value must not contain newlines"))
+	}
+
+	return warnings, errs
+}
+
+// containerLXCConfigEntry represents a single low-level LXC configuration line.
+type containerLXCConfigEntry struct {
+	Key   string
+	Value string
+}
+
+func containerGetLXCConfigs(list []any) []containerLXCConfigEntry {
+	configs := make([]containerLXCConfigEntry, len(list))
+
+	for i, entry := range list {
+		entryMap := entry.(map[string]any)
+		configs[i] = containerLXCConfigEntry{
+			Key:   entryMap[mkLXCKey].(string),
+			Value: entryMap[mkLXCValue].(string),
+		}
+	}
+
+	return configs
+}
+
+// containerLXCConfigLines builds the full set of lxc.* lines to write to the
+// container configuration file, combining idmap entries with generic lxc entries.
+func containerLXCConfigLines(
+	idmaps []containers.CustomIDMapEntry,
+	configs []containerLXCConfigEntry,
+) []string {
+	lines := make([]string, 0, len(idmaps)+len(configs))
+
+	for _, entry := range idmaps {
+		typeChar := "u"
+		if entry.Type == "gid" {
+			typeChar = "g"
+		}
+
+		lines = append(lines, fmt.Sprintf("lxc.idmap: %s %d %d %d", typeChar, entry.ContainerID, entry.HostID, entry.Size))
+	}
+
+	for _, entry := range configs {
+		lines = append(lines, fmt.Sprintf("lxc.%s: %s", entry.Key, entry.Value))
+	}
+
+	return lines
+}
+
+// containerMergedLXCLines builds the final set of lxc.* lines to write to the container
+// config file: idmap lines from the declared idmap blocks, then undeclared lines already
+// present in the config, then the declared lxc entries.
+//
+// Undeclared lines are preserved so that clone resources (whose Read clone-guard keeps
+// inherited lines out of the state) don't silently wipe template-inherited lines (e.g.
+// GPU/nvidia entries). For non-clone resources Read imports all raw lines into the state,
+// so nothing extra is preserved and behavior is pure take-ownership. A line whose key was
+// previously declared but is no longer declared is NOT preserved (its key stays managed)
+// and gets deleted.
+func containerMergedLXCLines(
+	raw [][2]string,
+	idmaps []containers.CustomIDMapEntry,
+	oldConfigs []containerLXCConfigEntry,
+	newConfigs []containerLXCConfigEntry,
+) []string {
+	managedKeys := make(map[string]bool, len(oldConfigs)+len(newConfigs))
+	for _, entry := range oldConfigs {
+		managedKeys[entry.Key] = true
+	}
+
+	for _, entry := range newConfigs {
+		managedKeys[entry.Key] = true
+	}
+
+	lines := containerLXCConfigLines(idmaps, nil)
+
+	for _, pair := range raw {
+		if pair[0] == "lxc.idmap" {
+			continue
+		}
+
+		key := strings.TrimPrefix(pair[0], "lxc.")
+		if managedKeys[key] {
+			continue
+		}
+
+		lines = append(lines, pair[0]+": "+pair[1])
+	}
+
+	return append(lines, containerLXCConfigLines(nil, newConfigs)...)
+}
+
+// containerSedEscapeReplacement escapes a string for the replacement side of a sed
+// s|...|...| command: backslashes first, then the & and | metacharacters.
+func containerSedEscapeReplacement(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `&`, `\&`)
+	s = strings.ReplaceAll(s, `|`, `\|`)
+
+	return s
+}
+
+// containerShellQuote wraps s in single quotes for POSIX shell, escaping embedded quotes.
+func containerShellQuote(s string) string {
+	return `'` + strings.ReplaceAll(s, `'`, `'\''`) + `'`
+}
+
+// containerLXCDeleteCommand returns the command deleting all lxc.* lines (including
+// lxc.idmap) from the main section of the container config file — everything before the
+// first [snapshot] section header. Snapshot sections are left untouched; when no section
+// header exists the whole file is the main section.
+func containerLXCDeleteCommand(configFile string) string {
+	return fmt.Sprintf(`try_sudo sed -i '1,/^\[/{/^lxc\./d;}' %s`, configFile)
+}
+
+// containerLXCInsertCommand returns the command appending the given lines to the main
+// section of the container config file. When snapshots exist the lines are inserted
+// before the first [snapshot] section header via a single sed substitution; otherwise
+// they are appended at EOF (the whole file is the main section).
+func containerLXCInsertCommand(configFile string, lines []string, hasSnapshots bool) string {
+	if hasSnapshots {
+		escaped := make([]string, len(lines))
+		for i, line := range lines {
+			escaped[i] = containerSedEscapeReplacement(line)
+		}
+
+		script := fmt.Sprintf(`1,/^\[/ s|^\[|%s\n\n[|`, strings.Join(escaped, `\n`))
+
+		return fmt.Sprintf(`try_sudo sed -i %s %s`, containerShellQuote(script), configFile)
+	}
+
+	content := base64.StdEncoding.EncodeToString([]byte(strings.Join(lines, "\n")))
+
+	return fmt.Sprintf(`printf '%%s' %q | base64 -d | try_sudo tee -a %s > /dev/null`, content, configFile)
+}
+
+// containerHasSnapshots reports whether the container has any real snapshots. The
+// snapshot list always contains a pseudo-entry named "current"; any other entry means
+// real snapshots exist.
+func containerHasSnapshots(ctx context.Context, containerAPI *containers.Client) (bool, error) {
+	snapshots, err := containerAPI.ListSnapshots(ctx)
+	if err != nil {
+		return false, fmt.Errorf("listing container snapshots: %w", err)
+	}
+
+	for _, snapshot := range snapshots {
+		if snapshot.Name != nil && *snapshot.Name != "current" {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// containerSetLXCConfigs writes the idmap and low-level lxc configuration to the
+// container config file via SSH (the API does not support lxc[n] parameters). The whole
+// main section is rewritten: all lxc.* lines are deleted and the merged set (idmaps,
+// preserved undeclared lines, declared lxc entries) is written back.
+func containerSetLXCConfigs(
 	ctx context.Context,
 	client proxmox.Client,
 	nodeName string,
 	vmID int,
 	idmaps []containers.CustomIDMapEntry,
+	oldLXCConfigs []containerLXCConfigEntry,
+	newLXCConfigs []containerLXCConfigEntry,
 ) error {
+	containerAPI := client.Node(nodeName).Container(vmID)
+
+	// The rewrite below deletes every lxc.* line in the main section; undeclared lines
+	// (manual or template-inherited) are merged back in so they survive the rewrite.
+	currentConfig, err := containerAPI.GetContainer(ctx)
+	if err != nil {
+		return fmt.Errorf("retrieving container config before writing lxc entries: %w", err)
+	}
+
+	lines := containerMergedLXCLines(currentConfig.LXCConfig.Raw, idmaps, oldLXCConfigs, newLXCConfigs)
+
 	configFile := fmt.Sprintf("/etc/pve/lxc/%d.conf", vmID)
 
 	commands := []string{
 		`set -e`,
 		ssh.TrySudo,
-		fmt.Sprintf(`try_sudo sed -i '/^lxc\.idmap:/d' %s`, configFile),
+		containerLXCDeleteCommand(configFile),
 	}
 
-	if len(idmaps) > 0 {
-		lines := make([]string, 0, len(idmaps))
-
-		for _, entry := range idmaps {
-			typeChar := "u"
-			if entry.Type == "gid" {
-				typeChar = "g"
-			}
-
-			lines = append(lines, fmt.Sprintf("lxc.idmap: %s %d %d %d", typeChar, entry.ContainerID, entry.HostID, entry.Size))
+	if len(lines) > 0 {
+		hasSnapshots, err := containerHasSnapshots(ctx, containerAPI)
+		if err != nil {
+			return err
 		}
 
-		commands = append(commands,
-			fmt.Sprintf(`echo '%s' | try_sudo tee -a %s > /dev/null`, strings.Join(lines, "\n"), configFile))
+		commands = append(commands, containerLXCInsertCommand(configFile, lines, hasSnapshots))
 	}
 
-	_, err := client.SSH().ExecuteNodeCommands(ctx, nodeName, commands)
+	_, err = client.SSH().ExecuteNodeCommands(ctx, nodeName, commands)
 	if err != nil {
-		return fmt.Errorf("setting idmap entries via SSH: %w", err)
+		return fmt.Errorf("setting lxc configuration via SSH: %w", err)
 	}
 
 	return nil
@@ -2724,13 +2963,16 @@ func containerRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diag
 		return diag.FromErr(e)
 	}
 
-	// Fix terraform.tfstate, by replacing '-1' (the old default value) with actual vm_id value
-	if storedVMID := d.Get(mkVMID).(int); storedVMID == -1 {
-		diags = append(diags, diag.Diagnostic{
-			Severity: diag.Warning,
-			Summary: fmt.Sprintf("VM %s has stored legacy vm_id %d, setting vm_id to its correct value %d.",
-				d.Id(), storedVMID, vmID),
-		})
+	// Fix terraform.tfstate, by replacing '-1' (the old default value) or '0'
+	// (unset, e.g. right after an import) with the actual vm_id value.
+	if storedVMID := d.Get(mkVMID).(int); storedVMID <= 0 {
+		if storedVMID == -1 {
+			diags = append(diags, diag.Diagnostic{
+				Severity: diag.Warning,
+				Summary: fmt.Sprintf("VM %s has stored legacy vm_id %d, setting vm_id to its correct value %d.",
+					d.Id(), storedVMID, vmID),
+			})
+		}
 
 		err := d.Set(mkVMID, vmID)
 		diags = append(diags, diag.FromErr(err)...)
@@ -3085,6 +3327,29 @@ func containerRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diag
 
 	err := d.Set(mkIDMap, idmapList)
 	diags = append(diags, diag.FromErr(err)...)
+
+	lxcList := make([]map[string]any, 0, len(containerConfig.LXCConfig.Raw))
+	for _, pair := range containerConfig.LXCConfig.Raw {
+		if pair[0] == "lxc.idmap" {
+			continue
+		}
+
+		key := strings.TrimPrefix(pair[0], "lxc.")
+		lxcList = append(lxcList, map[string]any{
+			mkLXCKey:   key,
+			mkLXCValue: pair[1],
+		})
+	}
+
+	if len(clone) > 0 {
+		if len(d.Get(mkLXC).([]any)) > 0 {
+			err = d.Set(mkLXC, lxcList)
+			diags = append(diags, diag.FromErr(err)...)
+		}
+	} else {
+		err = d.Set(mkLXC, lxcList)
+		diags = append(diags, diag.FromErr(err)...)
+	}
 
 	mountPointsMap := make(map[string]any, len(containerConfig.MountPoints))
 
@@ -3976,14 +4241,18 @@ func containerUpdate(ctx context.Context, d *schema.ResourceData, m any) (update
 		bodyDirty = true
 	}
 
-	// Prepare the new idmap configuration (applied via SSH after the lock is released).
+	// Prepare the new idmap and low-level lxc configuration (applied via SSH after the lock is released).
 	var idmaps []containers.CustomIDMapEntry
 
 	idmapChanged := d.HasChange(mkIDMap)
 	if idmapChanged {
 		_, newIDMap := d.GetChange(mkIDMap)
 		idmaps = containerGetIDMaps(newIDMap.([]any))
+	}
 
+	lxcChanged := d.HasChange(mkLXC)
+
+	if idmapChanged || lxcChanged {
 		rebootRequired = true
 	}
 
@@ -4239,10 +4508,14 @@ func containerUpdate(ctx context.Context, d *schema.ResourceData, m any) (update
 		return diag.FromErr(e)
 	}
 
-	// Apply idmap configuration via SSH (the API does not support lxc[n] parameters).
+	// Apply idmap and low-level lxc configuration via SSH (the API does not support lxc[n] parameters).
 	// This must happen after the lock is released to avoid PVE overwriting the config file.
-	if idmapChanged {
-		if err := containerSetIDMaps(ctx, client, nodeName, vmID, idmaps); err != nil {
+	if idmapChanged || lxcChanged {
+		oldLXCRaw, _ := d.GetChange(mkLXC)
+		oldLXCConfigs := containerGetLXCConfigs(oldLXCRaw.([]any))
+		lxcConfigs := containerGetLXCConfigs(d.Get(mkLXC).([]any))
+
+		if err := containerSetLXCConfigs(ctx, client, nodeName, vmID, idmaps, oldLXCConfigs, lxcConfigs); err != nil {
 			return diag.FromErr(err)
 		}
 	}
